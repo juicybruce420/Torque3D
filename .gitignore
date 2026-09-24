@@ -184,6 +184,7 @@ pip-log.txt
 ## Torque
 #############
 /AGENTS.md
+/AGENTS-reference.md
 *.dso
 console.log
 *.cached.dts
