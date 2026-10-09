@@ -981,6 +981,11 @@ ShapeBase::ShapeBase()
    mControllingObject( NULL ),
    mAiPose( 0 ),
    mMoveMotion( false ),
+   mImageSimulationTick(0),
+   mRestoringImageSimulation(false),
+   mAdvancingImageSimulation(false),
+   mImageTransitionDepth(0),
+   mImageTransitionBudget(128),
    mShapeBaseMount( NULL ),
    mShapeInstance( NULL ),
    mCubeReflector(NULL),
@@ -1460,7 +1465,8 @@ void ShapeBase::processTick(const Move* move)
       updateServerAudio();
 
       // update wet state
-      setImageWetState(0, mWaterCoverage > 0.4); // more than 40 percent covered
+      if (!usesPredictedImageState(0))
+         setImageWetState(0, mWaterCoverage > 0.4); // more than 40 percent covered
 
       // update motion state
       mMoveMotion = false;
@@ -1470,7 +1476,8 @@ void ShapeBase::processTick(const Move* move)
       }
       for (S32 i = 0; i < MaxMountedImages; i++)
       {
-         setImageMotionState(i, mMoveMotion);
+         if (!usesPredictedImageState(i))
+            setImageMotionState(i, mMoveMotion);
       }
 
       if(mFading)
@@ -1493,7 +1500,7 @@ void ShapeBase::processTick(const Move* move)
    {
       for (S32 i = 0; i < MaxMountedImages; i++)
       {
-         if (mMountedImageList[i].dataBlock)
+         if (mMountedImageList[i].dataBlock && !usesPredictedImageState(i))
             updateImageState(i, TickSec);
       }
    }
@@ -1535,6 +1542,7 @@ void ShapeBase::processTick(const Move* move)
 
 void ShapeBase::advanceTime(F32 dt)
 {
+   dispatchImagePresentation();
    // On the client, the shape threads and images are
    // advanced at framerate.
    advanceThreads(dt);
@@ -1542,7 +1550,8 @@ void ShapeBase::advanceTime(F32 dt)
    for (S32 i = 0; i < MaxMountedImages; i++)
       if (mMountedImageList[i].dataBlock)
       {
-         updateImageState(i, dt);
+         if (!usesPredictedImageState(i))
+            updateImageState(i, dt);
          updateImageAnimation(i, dt);
       }
 
@@ -3251,7 +3260,9 @@ U32 ShapeBase::packUpdate(NetConnection *con, U32 mask, BitStream *stream)
 
    if (stream->writeFlag(mask & ImageMask)) {
       for (S32 i = 0; i < MaxMountedImages; i++)
-         if (stream->writeFlag(mask & (ImageMaskN << i))) {
+         if (stream->writeFlag((mask & (ImageMaskN << i)) &&
+             !(!(mask & InitialUpdateMask) && getControllingClient() == con &&
+               mMountedImageList[i].dataBlock && mMountedImageList[i].dataBlock->aimMotionEnabled))) {
             MountedImage& image = mMountedImageList[i];
             if (stream->writeFlag(image.dataBlock))
                stream->writeInt(image.dataBlock->getId() - DataBlockObjectIdFirst,

@@ -97,6 +97,12 @@ struct PlayerData: public ShapeBaseData /*protected AssetPtrCallback < already i
    F32 maxLookAngle;          ///< Highest angle (radians) the player can look
    F32 maxFreelookAngle;      ///< Max left/right angle the player can look
 
+   enum { AimMotionProfileCount = 5 }; ///< Stand, sprint, crouch, prone, swim (Player::Pose).
+   Point3F aimMotionIdle[AimMotionProfileCount];   ///< Yaw degrees, pitch degrees, cycles/second.
+   Point3F aimMotionMoving[AimMotionProfileCount];
+   F32 aimMotionRecoilScale[AimMotionProfileCount];
+   F32 aimMotionTransitionTime;
+
    F32 minProneLookAngle;   //< Lowest angle (radians) the player can look when prone.  Should be >= minLookAngle. -Skurps
    F32 maxProneLookAngle;   ///< Highest angle (radians) the player can look when prone. Should be <= maxLookAngle. -Skurps
 
@@ -454,7 +460,8 @@ protected:
       MoveMask     = Parent::NextFreeMask << 1,
       ImpactMask   = Parent::NextFreeMask << 2,
       TriggerMask      = Parent::NextFreeMask << 3,
-      NextFreeMask     = Parent::NextFreeMask << 4
+      AimMotionMask    = Parent::NextFreeMask << 4,
+      NextFreeMask     = Parent::NextFreeMask << 5
    };
 
    SimObjectPtr<ParticleEmitter> mSplashEmitter[PlayerData::NUM_SPLASH_EMITTERS];
@@ -485,6 +492,25 @@ protected:
    };
    StateDelta mDelta;                ///< Used for interpolation on the client.  @see StateDelta
    S32 mPredictionCount;            ///< Number of ticks to predict
+
+   struct AimMotionState
+   {
+      F32 phase;
+      F32 phaseStep;
+      Point3F profile;
+      Point3F previousProfile;
+   } mAimMotion;
+   F32 mAimMotionScale;
+   F32 mCameraRecoilScale;
+   void resetAimMotionState();
+   void refreshAimMotionScales();
+   Point3F resolveAimMotionProfile() const;
+   void advanceAimMotion(F32 dt);
+   void applyCameraRecoil(U32 slot, const ImageShotKey& key);
+   void writeAimMotionState(BitStream* stream);
+   void readAimMotionState(BitStream* stream);
+   bool usesPredictedImageState(U32 imageSlot) const override;
+   void onImageShotCommitted(U32 imageSlot, const ImageShotKey& key) override;
 
    // Current pos, vel etc.
    Point3F mHead;                   ///< Head rotation, uses only x & z
@@ -768,6 +794,30 @@ public:
    void getRenderMuzzleTransform(U32 imageSlot,MatrixF* mat) override;   
 
    void getMuzzleVector(U32 imageSlot,VectorF* vec) override;
+   void getRenderMuzzleVector(U32 imageSlot,VectorF* vec) override;
+   void getImageAimOffset(U32 imageSlot, bool render, MatrixF* mat) override;
+   struct AimMotionSample
+   {
+      F32 yaw;
+      F32 pitch;
+   };
+   struct AimSolution
+   {
+      Point3F rayOrigin;
+      VectorF rayDirection;
+      Point3F muzzlePoint;
+      VectorF muzzleVector;
+      Point3F target;
+      SimObjectPtr<SceneObject> hitObject;
+   };
+   bool evaluateAimMotion(U32 slot, bool render, AimMotionSample* sample) const;
+   bool getAimRay(U32 slot, bool render, Point3F* origin, VectorF* direction);
+   bool getAimSolution(U32 slot, bool render, AimSolution* solution);
+   void getImagePlacementTransform(U32 slot, bool render, MatrixF* mat) override;
+#ifdef TORQUE_DEBUG
+   bool validateAimMotion();
+#endif
+   void onDynamicModified(const char* slotName, const char* newValue = NULL) override;
    /// @}
 
    F32 getSpeed() const;

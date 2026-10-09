@@ -320,6 +320,14 @@ PlayerData::PlayerData()
    maxProneLookAngle = .3491f; // Skurps
    maxFreelookAngle = 3.0f;
 
+   aimMotionTransitionTime = 0.15f;
+   for (U32 i = 0; i < AimMotionProfileCount; ++i)
+   {
+      aimMotionIdle[i].set(0, 0, 0);
+      aimMotionMoving[i].set(0, 0, 0);
+      aimMotionRecoilScale[i] = 1.0f;
+   }
+
    maxTimeScale = 1.5f;
 
    mass = 9.0f;         // from ShapeBase
@@ -487,6 +495,30 @@ PlayerData::PlayerData()
 
 bool PlayerData::preload(bool server, String &errorStr)
 {
+   if (!(aimMotionTransitionTime >= 0.0f && aimMotionTransitionTime <= 60.0f))
+   {
+      errorStr = "aimMotionTransitionTime must be between 0 and 60 seconds.";
+      return false;
+   }
+   for (U32 i = 0; i < AimMotionProfileCount; ++i)
+   {
+      const Point3F profiles[] = { aimMotionIdle[i], aimMotionMoving[i] };
+      for (U32 j = 0; j < 2; ++j)
+      {
+         const Point3F& profile = profiles[j];
+         if (!(profile.x >= 0 && profile.x <= 45 && profile.y >= 0 && profile.y <= 45 &&
+               profile.z >= 0 && profile.z <= 20))
+         {
+            errorStr = "Aim profiles require yaw/pitch amplitudes in 0..45 degrees and frequency in 0..20 Hz.";
+            return false;
+         }
+      }
+      if (!(aimMotionRecoilScale[i] >= 0 && aimMotionRecoilScale[i] <= 1000))
+      {
+         errorStr = "aimMotionRecoilScale must be between 0 and 1000.";
+         return false;
+      }
+   }
    if(!Parent::preload(server, errorStr))
       return false;
    if (!server) {
@@ -767,6 +799,17 @@ void PlayerData::initPersistFields()
 {
    docsURL;
    Parent::initPersistFields();
+
+   addGroup("Procedural Aim");
+   addField("aimMotionIdle", TypePoint3F, Offset(aimMotionIdle, PlayerData), AimMotionProfileCount,
+      "Idle yaw/pitch amplitudes in degrees and frequency in Hz; indices: stand, sprint, crouch, prone, swim.");
+   addField("aimMotionMoving", TypePoint3F, Offset(aimMotionMoving, PlayerData), AimMotionProfileCount,
+      "Moving yaw/pitch amplitudes in degrees and frequency in Hz; blended by actual horizontal speed.");
+   addField("aimMotionRecoilScale", TypeF32, Offset(aimMotionRecoilScale, PlayerData), AimMotionProfileCount,
+      "Stance multiplier for permanent camera recoil.");
+   addField("aimMotionTransitionTime", TypeF32, Offset(aimMotionTransitionTime, PlayerData),
+      "Seconds used to blend changes in procedural motion amplitude/frequency.");
+   endGroup("Procedural Aim");
 
    addFieldV( "pickupRadius", TypeRangedF32, Offset(pickupRadius, PlayerData), &CommonValidators::PositiveFloat,
       "@brief Radius around the player to collide with Items in the scene (on server).\n\n"
@@ -1269,6 +1312,14 @@ void PlayerData::packData(BitStream* stream)
 {
    Parent::packData(stream);
 
+   stream->write(aimMotionTransitionTime);
+   for (U32 i = 0; i < AimMotionProfileCount; ++i)
+   {
+      mathWrite(*stream, aimMotionIdle[i]);
+      mathWrite(*stream, aimMotionMoving[i]);
+      stream->write(aimMotionRecoilScale[i]);
+   }
+
    stream->writeFlag(renderFirstPerson);
    stream->writeFlag(firstPersonShadows);
    
@@ -1463,6 +1514,14 @@ void PlayerData::packData(BitStream* stream)
 void PlayerData::unpackData(BitStream* stream)
 {
    Parent::unpackData(stream);
+
+   stream->read(&aimMotionTransitionTime);
+   for (U32 i = 0; i < AimMotionProfileCount; ++i)
+   {
+      mathRead(*stream, &aimMotionIdle[i]);
+      mathRead(*stream, &aimMotionMoving[i]);
+      stream->read(&aimMotionRecoilScale[i]);
+   }
 
    renderFirstPerson = stream->readFlag();
    firstPersonShadows = stream->readFlag();
@@ -1699,6 +1758,8 @@ Player::Player()
    mAngularVelocity.set(0.0f,0.0f,0.0f); //Skurps
    mAnimVelocity.set(0.0f,0.0f,0.0f); //Skurps
    mDataBlock = 0;
+   mAimMotionScale = mCameraRecoilScale = 1.0f;
+   resetAimMotionState();
    mHeadHThread = mHeadVThread = mRecoilThread = mImageStateThread = 0;
    mArmAnimation.action = PlayerData::NullAnimation;
    mArmAnimation.thread = 0;
@@ -1917,6 +1978,9 @@ bool Player::onNewDataBlock( GameBaseData *dptr, bool reload )
    if ( !mDataBlock || !Parent::onNewDataBlock( dptr, reload ) )
       return false;
 
+   resetAimMotionState();
+   refreshAimMotionScales();
+
    // Player requires a shape instance.
    if ( mShapeInstance == NULL )
       return false;
@@ -2109,6 +2173,485 @@ ShapeBase* Player::getControlObject()
    return mControlObject;
 }
 
+void Player::resetAimMotionState()
+{
+   mAimMotion.phase = mAimMotion.phaseStep = 0.0f;
+   mAimMotion.profile.set(0, 0, 0);
+   mAimMotion.previousProfile = mAimMotion.profile;
+}
+
+void Player::refreshAimMotionScales()
+{
+   if (!isServerObject())
+      return;
+
+   const char* names[] = { "aimMotionScale", "cameraRecoilScale" };
+   F32* scales[] = { &mAimMotionScale, &mCameraRecoilScale };
+   for (U32 i = 0; i < 2; ++i)
+   {
+      const char* value = getDataField(StringTable->insert(names[i]), NULL);
+      F32 scale = 1.0f;
+      char trailing;
+      if (value && value[0] && (dSscanf(value, "%f %c", &scale, &trailing) != 1 ||
+          !(scale >= 0.0f && scale <= 1000.0f)))
+      {
+         Con::warnf("Player %u: %s must be a finite number in 0..1000; retaining the previous value.", getId(), names[i]);
+         continue;
+      }
+      if (*scales[i] != scale)
+      {
+         *scales[i] = scale;
+         setMaskBits(AimMotionMask);
+      }
+   }
+}
+
+void Player::onDynamicModified(const char* slotName, const char* newValue)
+{
+   Parent::onDynamicModified(slotName, newValue);
+   if (!dStricmp(slotName, "aimMotionScale") || !dStricmp(slotName, "cameraRecoilScale"))
+      refreshAimMotionScales();
+}
+
+Point3F Player::resolveAimMotionProfile() const
+{
+   if (!mDataBlock || mDamageState != Enabled)
+      return Point3F::Zero;
+
+   const U32 pose = getMin(U32(mPose), U32(PlayerData::AimMotionProfileCount - 1));
+   F32 maxSpeed = getMax(mDataBlock->maxForwardSpeed, mDataBlock->maxSideSpeed);
+   if (mPose == SprintPose)
+      maxSpeed = getMax(mDataBlock->maxSprintForwardSpeed, mDataBlock->maxSprintSideSpeed);
+   else if (mPose == CrouchPose)
+      maxSpeed = getMax(mDataBlock->maxCrouchForwardSpeed, mDataBlock->maxCrouchSideSpeed);
+   else if (mPose == PronePose)
+      maxSpeed = getMax(mDataBlock->maxProneForwardSpeed, mDataBlock->maxProneSideSpeed);
+   else if (mPose == SwimPose)
+      maxSpeed = getMax(mDataBlock->maxUnderwaterForwardSpeed, mDataBlock->maxUnderwaterSideSpeed);
+
+   const F32 speed = mSqrt(mVelocity.x * mVelocity.x + mVelocity.y * mVelocity.y);
+   const F32 amount = maxSpeed > 0.0f ? mClampF(speed / maxSpeed, 0.0f, 1.0f) : 0.0f;
+   Point3F profile;
+   profile.interpolate(mDataBlock->aimMotionIdle[pose], mDataBlock->aimMotionMoving[pose], amount);
+   return profile;
+}
+
+void Player::advanceAimMotion(F32 dt)
+{
+   mAimMotion.previousProfile = mAimMotion.profile;
+   const F32 blend = mDataBlock->aimMotionTransitionTime > 0.0f ?
+      mClampF(dt / mDataBlock->aimMotionTransitionTime, 0.0f, 1.0f) : 1.0f;
+   mAimMotion.profile.interpolate(mAimMotion.profile, resolveAimMotionProfile(), blend);
+   mAimMotion.phaseStep = M_2PI_F * mAimMotion.profile.z * dt;
+   mAimMotion.phase = mWrapF(mAimMotion.phase + mAimMotion.phaseStep, 0.0f, M_2PI_F);
+   if (isServerObject())
+      setMaskBits(AimMotionMask);
+}
+
+bool Player::usesPredictedImageState(U32 slot) const
+{
+   if (slot >= MaxMountedImages || !mMountedImageList[slot].dataBlock ||
+       !mMountedImageList[slot].dataBlock->aimMotionEnabled || mIsAiControlled)
+      return false;
+   const GameConnection* connection = getControllingClient();
+   return connection && !connection->isAIControlled() && connection->getControlObject() == this;
+}
+
+bool Player::evaluateAimMotion(U32 slot, bool render, AimMotionSample* sample) const
+{
+   sample->yaw = sample->pitch = 0.0f;
+   if (slot >= MaxMountedImages || !mMountedImageList[slot].dataBlock ||
+       !mMountedImageList[slot].dataBlock->aimMotionEnabled || mIsAiControlled || !isFirstPerson())
+      return false;
+   Point3F profile = mAimMotion.profile;
+   F32 phase = mAimMotion.phase;
+   if (render && isGhost())
+   {
+      profile.interpolate(mAimMotion.profile, mAimMotion.previousProfile, mDelta.dt);
+      phase -= mAimMotion.phaseStep * mDelta.dt;
+   }
+   const F32 scale = mAimMotionScale * mMountedImageList[slot].dataBlock->aimMotionScale;
+   // Torque's negative head pitch looks upward. Keep view-space motion and aim identical.
+   sample->yaw = mDegToRad(mClampF(profile.x * scale, 0.0f, 45.0f)) * mSin(phase);
+   sample->pitch = -mDegToRad(mClampF(profile.y * scale, 0.0f, 45.0f)) * mSin(phase * 2.0f);
+   return true;
+}
+
+void Player::getImageAimOffset(U32 slot, bool render, MatrixF* mat)
+{
+   AimMotionSample sample;
+   evaluateAimMotion(slot, render, &sample);
+   mat->set(EulerF(sample.pitch, 0.0f, sample.yaw));
+}
+
+void Player::getImagePlacementTransform(U32 slot, bool render, MatrixF* mat)
+{
+   Parent::getImagePlacementTransform(slot, render, mat);
+   const MountedImage& image = mMountedImageList[slot];
+   if (!render || slot != 0 || !isFirstPerson() || !image.dataBlock || !image.dataBlock->aimMotionEnabled)
+      return;
+   const U32 shapeIndex = getImageShapeIndex(image);
+   const S32 node = image.dataBlock->retractNode[shapeIndex] != -1 ?
+      image.dataBlock->retractNode[shapeIndex] : image.dataBlock->muzzleNode[shapeIndex];
+   if (node != -1 && image.shapeInstance[shapeIndex])
+   {
+      image.shapeInstance[shapeIndex]->animate();
+      Point3F end = image.shapeInstance[shapeIndex]->mNodeTransforms[node].getPosition();
+      mat->mulP(end);
+      // Attachments and drawing share the same wall-retraction displacement.
+      mat->setPosition(mat->getPosition() + (mat->getPosition() - end) * mWeaponBackFraction);
+   }
+}
+
+bool Player::getAimRay(U32 slot, bool render, Point3F* origin, VectorF* direction)
+{
+   AimMotionSample sample;
+   if (!evaluateAimMotion(slot, render, &sample))
+      return false;
+   MatrixF eye, offset;
+   // Use the eye base, not the weapon's animated eye node or client-only camera shake.
+   if (render && isGhost())
+      getRenderEyeBaseTransform(&eye, true);
+   else
+      getEyeBaseTransform(&eye, true);
+   getImageAimOffset(slot, render, &offset);
+   eye.mul(offset);
+   eye.getColumn(3, origin);
+   eye.getColumn(1, direction);
+   direction->normalizeSafe();
+   return true;
+}
+
+bool Player::getAimSolution(U32 slot, bool render, AimSolution* solution)
+{
+   if (!getAimRay(slot, render, &solution->rayOrigin, &solution->rayDirection))
+      return false;
+   MatrixF muzzle;
+   if (render && isGhost())
+      getRenderMuzzleTransform(slot, &muzzle);
+   else
+      getMuzzleTransform(slot, &muzzle);
+   solution->muzzlePoint = muzzle.getPosition();
+   const ShapeBaseImageData* image = mMountedImageList[slot].dataBlock;
+   if (!image->correctMuzzleVector || !getCorrectedAimFromRay(muzzle, solution->rayOrigin,
+       solution->rayDirection, &solution->muzzleVector, &solution->target))
+   {
+      muzzle.getColumn(1, &solution->muzzleVector);
+      solution->muzzleVector.normalizeSafe();
+      solution->target = solution->muzzlePoint + solution->muzzleVector * 500.0f;
+   }
+
+   // Display the nominal muzzle path, including a nearer obstruction between muzzle and target.
+   RayInfo hit;
+   disableCollision();
+   if (getContainer()->castRay(solution->muzzlePoint, solution->target,
+       STATIC_COLLISION_TYPEMASK | DAMAGEABLE_TYPEMASK, &hit))
+   {
+      solution->target = hit.point;
+      solution->hitObject = hit.object;
+   }
+   else
+      solution->hitObject = NULL;
+   enableCollision();
+   return true;
+}
+
+void Player::applyCameraRecoil(U32 slot, const ImageShotKey& key)
+{
+   if (mDamageState != Enabled || slot >= MaxMountedImages ||
+       !mMountedImageList[slot].dataBlock || mMountedImageList[slot].simulation.generation != key.generation)
+      return;
+   const F32 scale = mDataBlock->aimMotionRecoilScale[mPose] * mCameraRecoilScale;
+   const F32 kick = mDegToRad(mClampF(mMountedImageList[slot].dataBlock->cameraRecoilPitch * scale, 0.0f, 90.0f));
+   const F32 minPitch = mPose == PronePose ? mDataBlock->minProneLookAngle : mDataBlock->minLookAngle;
+   const F32 maxPitch = mPose == PronePose ? mDataBlock->maxProneLookAngle : mDataBlock->maxLookAngle;
+   const F32 previousPitch = mHead.x;
+   mHead.x = mClampF(mHead.x - kick, minPitch, maxPitch);
+   mDelta.head = mHead;
+   mDelta.headVec.x += previousPitch - mHead.x;
+   if (isServerObject())
+      setMaskBits(MoveMask);
+}
+
+void Player::onImageShotCommitted(U32 slot, const ImageShotKey& key)
+{
+   if (usesPredictedImageState(slot))
+      applyCameraRecoil(slot, key);
+}
+
+void Player::writeAimMotionState(BitStream* stream)
+{
+   stream->write(mAimMotion.phase);
+   stream->write(mAimMotion.phaseStep);
+   mathWrite(*stream, mAimMotion.profile);
+   mathWrite(*stream, mAimMotion.previousProfile);
+   stream->write(mAimMotionScale);
+   stream->write(mCameraRecoilScale);
+}
+
+void Player::readAimMotionState(BitStream* stream)
+{
+   stream->read(&mAimMotion.phase);
+   stream->read(&mAimMotion.phaseStep);
+   mathRead(*stream, &mAimMotion.profile);
+   mathRead(*stream, &mAimMotion.previousProfile);
+   stream->read(&mAimMotionScale);
+   stream->read(&mCameraRecoilScale);
+}
+
+#ifdef TORQUE_DEBUG
+bool Player::validateAimMotion()
+{
+   // Isolated game harness supplies a three-state image and an acceptance callback.
+   if (!isServerObject() || !usesPredictedImageState(0) ||
+       dStricmp(mMountedImageList[0].dataBlock->getName(), "AimSmokeWeaponImage"))
+      return false;
+   bool passed = true;
+   const auto check = [&passed](bool condition, const char* name)
+   {
+      Con::printf("AIM_CHECK %s: %s", name, condition ? "PASS" : "FAIL");
+      passed &= condition;
+   };
+   // Imported stable clips must retain the same arm pose as authored idle.
+   Resource<TSShape> armShape = mDataBlock->shapeFPAssetRef[0].assetPtr->getShapeResource();
+   const char* weapons[] = { "Lurker", "Ryder" };
+   for (U32 weapon = 0; weapon < 2; ++weapon)
+   {
+      TSShapeInstance arms(armShape, false);
+      TSThread* thread = arms.addThread();
+      S32 idle = armShape->findSequence(String::ToString("%s_idle", weapons[weapon]));
+      S32 aimIdle = armShape->findSequence(String::ToString("%s_aim_idle", weapons[weapon]));
+      bool matched = idle >= 0 && aimIdle >= 0;
+      F32 maxDistance = 0;
+      if (matched)
+      {
+         arms.setSequence(thread, idle, 0);
+         arms.animate();
+         Vector<MatrixF> reference = arms.mNodeTransforms;
+         arms.setSequence(thread, aimIdle, 0);
+         arms.animate();
+         for (U32 node = 0; node < reference.size(); ++node)
+         {
+            F32 distance = (reference[node].getPosition() - arms.mNodeTransforms[node].getPosition()).len();
+            maxDistance = getMax(maxDistance, distance);
+         }
+         matched = maxDistance < 0.01f;
+      }
+      check(matched, String::ToString("%s stable arm pose matches authored idle", weapons[weapon]));
+      ShapeBaseImageData* imageData = NULL;
+      Sim::findObject(String::ToString("%sWeaponImage", weapons[weapon]), imageData);
+      bool aligned = imageData != NULL;
+      if (aligned)
+      {
+         Resource<TSShape> weaponShape = imageData->shapeAssetRef[ShapeBaseImageData::FirstPersonImageShape].assetPtr->getShapeResource();
+         TSShapeInstance gun(weaponShape, false);
+         TSThread* gunThread = gun.addThread();
+         const S32 mountNode = weaponShape->findNode("MOUNTPOINT");
+         const char* hands[] = { "Bip001_L_Hand", "Bip001_R_Hand" };
+         for (U32 sample = 0; sample <= 4; ++sample)
+         {
+            Point3F grip[2];
+            for (U32 variant = 0; variant < 2; ++variant)
+            {
+               const char* clip = variant ? "aim_fire" : "fire";
+               S32 gunSeq = weaponShape->findSequence(clip);
+               S32 armSeq = armShape->findSequence(String::ToString("%s_%s", weapons[weapon], clip));
+               if (gunSeq < 0 || armSeq < 0 || mountNode < 0)
+               {
+                  aligned = false;
+                  break;
+               }
+               gun.setSequence(gunThread, gunSeq, sample / 4.0f);
+               arms.setSequence(thread, armSeq, sample / 4.0f);
+               gun.animate();
+               arms.animate();
+               MatrixF mountInverse = gun.mNodeTransforms[mountNode];
+               mountInverse.affineInverse();
+               for (U32 hand = 0; hand < 2; ++hand)
+               {
+                  S32 handNode = armShape->findNode(hands[hand]);
+                  if (handNode < 0)
+                  {
+                     aligned = false;
+                     continue;
+                  }
+                  Point3F relative;
+                  mountInverse.mulP(arms.mNodeTransforms[handNode].getPosition(), &relative);
+                  if (!variant)
+                     grip[hand] = relative;
+                  else
+                     aligned &= (grip[hand] - relative).len() < 0.01f;
+               }
+            }
+         }
+      }
+      check(aligned, String::ToString("%s firing preserves hand-to-weapon alignment", weapons[weapon]));
+   }
+   const StringTableEntry aimScale = StringTable->insert("aimMotionScale");
+   const StringTableEntry recoilScale = StringTable->insert("cameraRecoilScale");
+   setDataField(aimScale, NULL, "0");
+   setDataField(recoilScale, NULL, "1");
+   AimMotionSample sample;
+   evaluateAimMotion(0, false, &sample);
+   check(sample.yaw == 0 && sample.pitch == 0, "zero sway multiplier");
+   setDataField(aimScale, NULL, "");
+   check(mAimMotionScale == 1.0f, "empty multiplier defaults to one");
+   mAimMotion.profile.set(1, 1, 1);
+   mAimMotion.previousProfile = mAimMotion.profile;
+   mAimMotion.phase = M_PI_F / 4;
+   evaluateAimMotion(0, false, &sample);
+   check(sample.yaw > 0 && sample.pitch < 0, "shared angular sample");
+   setDataField(aimScale, NULL, "0");
+   setDataField(StringTable->insert("testAccept"), NULL, "1");
+   mHead.x = 0;
+   mDelta.head = mHead;
+   mDelta.headVec.zero();
+   mMountedImageList[0].ammo = true;
+   setImagePredictionAmmo(0, 10);
+   VectorF before;
+   getMuzzleVector(0, &before);
+   const U32 accepted = mMountedImageList[0].simulation.acceptedSequence;
+   setImageState(0, 1, true);
+   VectorF captured;
+   const char* vector = getDataField(StringTable->insert("testShotVector"), NULL);
+   const bool parsed = dSscanf(vector, "%f %f %f", &captured.x, &captured.y, &captured.z) == 3;
+   check(parsed && (captured - before).len() < 0.0001f, "shot uses pre-recoil direction");
+   check(!dStrcmp(vector, getDataField(StringTable->insert("testSecondVector"), NULL)), "pellets share captured direction");
+   check(mMountedImageList[0].simulation.acceptedSequence > accepted &&
+      mFabs(mHead.x + mDegToRad(1.0f)) < 0.0001f, "accepted shot kicks once");
+   const F32 kickedPitch = mHead.x;
+   setDataField(StringTable->insert("testAccept"), NULL, "0");
+   setImageState(0, 1, true);
+   check(mHead.x == kickedPitch, "rejected callback has no recoil");
+   check(!confirmImageShot(0), "confirmation outside callback rejected");
+   setDataField(StringTable->insert("testAccept"), NULL, "1");
+   setDataField(recoilScale, NULL, "0");
+   setImageState(0, 1, true);
+   check(mHead.x == kickedPitch, "zero recoil multiplier");
+   for (U32 i = 0; i < 10; ++i)
+      advanceAimMotion(TickSec);
+   check(mHead.x == kickedPitch, "no automatic pitch recovery");
+   setDataField(recoilScale, NULL, "1");
+   mHead.x = mDataBlock->minLookAngle + 0.001f;
+   setImageState(0, 1, true);
+   check(mHead.x == mDataBlock->minLookAngle, "pitch limit clamps recoil");
+
+   U8 bytes[1500];
+   BitStream writer(bytes, sizeof(bytes));
+   GameConnection* connection = getControllingClient();
+   writePacketData(connection, &writer);
+   const F32 savedPhase = mAimMotion.phase;
+   const F32 savedPitch = mHead.x;
+   const U32 savedSequence = mMountedImageList[0].simulation.shotSequence;
+   mAimMotion.phase = 0;
+   mHead.x = 0;
+   mMountedImageList[0].simulation.shotSequence = 0;
+   BitStream reader(bytes, sizeof(bytes));
+   readPacketData(connection, &reader);
+   check(mAimMotion.phase == savedPhase && mHead.x == savedPitch &&
+      mMountedImageList[0].simulation.shotSequence == savedSequence &&
+      writer.getCurPos() == reader.getCurPos(), "owner snapshot round trip");
+
+   mHead.x = 0;
+   mDelta.head = mHead;
+   mDelta.headVec.zero();
+   mMountedImageList[0].triggerDown = false;
+   setImageState(0, 0, true);
+   U8 baseline[1500], authoritative[1500];
+   BitStream baselineWriter(baseline, sizeof(baseline));
+   writePacketData(connection, &baselineWriter);
+   mMountedImageList[0].triggerDown = true;
+   advanceImageSimulation(0, TickSec);
+   const F32 authoritativePitch = mHead.x;
+   const U32 authoritativeSequence = mMountedImageList[0].simulation.acceptedSequence;
+   BitStream authoritativeWriter(authoritative, sizeof(authoritative));
+   writePacketData(connection, &authoritativeWriter);
+   {
+      BitStream restore(baseline, sizeof(baseline));
+      readPacketData(connection, &restore);
+   }
+   // Exercise the same prediction branch without requiring a renderer or socket.
+   mNetFlags.set(IsGhost);
+   mMountedImageList[0].triggerDown = true;
+   advanceImageSimulation(0, TickSec);
+   check(mHead.x == authoritativePitch &&
+      mMountedImageList[0].simulation.acceptedSequence == authoritativeSequence,
+      "predicted shot agrees with authoritative recoil");
+   dispatchImagePresentation();
+   const U32 effects = mImagePresentationHistory.size();
+   {
+      BitStream restore(baseline, sizeof(baseline));
+      readPacketData(connection, &restore);
+   }
+   mMountedImageList[0].triggerDown = true;
+   advanceImageSimulation(0, TickSec);
+   dispatchImagePresentation();
+   check(mImagePresentationHistory.size() == effects && mHead.x == authoritativePitch,
+      "replay preserves recoil without repeated effects");
+   {
+      BitStream restore(baseline, sizeof(baseline));
+      readPacketData(connection, &restore);
+   }
+   check(mHead.x == 0, "rejected authoritative correction removes speculative kick");
+   {
+      BitStream restore(authoritative, sizeof(authoritative));
+      readPacketData(connection, &restore);
+   }
+   check(mHead.x == authoritativePitch, "acknowledgment does not add another kick");
+   mNetFlags.clear(IsGhost);
+   mMountedImageList[0].ammo = false;
+   setImagePredictionAmmo(0, 0);
+   setImageState(0, 0, true);
+   mMountedImageList[0].triggerDown = true;
+   advanceImageSimulation(0, TickSec);
+   check(mHead.x == authoritativePitch && !dStricmp(getImageState(0), "Dry"), "dry fire has no recoil");
+   // Exercise actual prefix resolution, not just explicitly named source clips.
+   // This isolated harness deletes the player immediately after validation.
+   mShapeFPInstance[0] = new TSShapeInstance(armShape, false);
+   mShapeFPAnimThread[0] = mShapeFPInstance[0]->addThread();
+   ShapeBaseImageData* ryder = NULL;
+   Sim::findObject("RyderWeaponImage", ryder);
+   bool selected = ryder != NULL;
+   if (selected)
+   {
+      NetStringHandle skin;
+      setImage(0, ryder, skin);
+      setImageScriptAnimPrefix(0, NetStringHandle("aim"));
+      MountedImage& image = mMountedImageList[0];
+      image.doAnimateAllShapes = true;
+      const char* clips[] = { "idle", "run", "sprint", "fire" };
+      for (U32 clip = 0; clip < 4; ++clip)
+      {
+         bool exercised = false;
+         for (U32 state = 0; state < ShapeBaseImageData::MaxStates; ++state)
+         {
+            S32 seq = ryder->state[state].sequence[ShapeBaseImageData::FirstPersonImageShape];
+            TSShapeInstance* gun = image.shapeInstance[ShapeBaseImageData::FirstPersonImageShape];
+            if (seq < 0 || dStricmp(gun->getShape()->getSequenceName(seq), clips[clip]))
+               continue;
+            image.state = &ryder->state[state];
+            updateAnimThread(0, ShapeBaseImageData::FirstPersonImageShape, &ryder->state[0]);
+            String expectedGun = String::ToString("soldier_aim_%s", clips[clip]);
+            String expectedArms = String::ToString("Ryder_aim_%s", clips[clip]);
+            selected &= gun->getSequence(image.animThread[ShapeBaseImageData::FirstPersonImageShape]) == gun->getShape()->findSequence(expectedGun)
+               && mShapeFPInstance[0]->getSequence(mShapeFPAnimThread[0]) == armShape->findSequence(expectedArms);
+            exercised = true;
+            break;
+         }
+         selected &= exercised;
+      }
+   }
+   check(selected, "Ryder runtime selects matching procedural weapon and arm clips");
+   return passed;
+}
+
+DefineEngineMethod(Player, validateAimMotion, bool, (),,
+   "Debug-only regression checks for the isolated aimMotionSmoke.tscript harness.")
+{
+   return object->validateAimMotion();
+}
+#endif
+
 void Player::processTick(const Move* move)
 {
    PROFILE_SCOPE(Player_ProcessTick);
@@ -2241,6 +2784,29 @@ void Player::processTick(const Move* move)
 
          updateDeathOffsets();
          updatePos();
+
+         bool simulateImages = false;
+         for (U32 slot = 0; slot < MaxMountedImages; ++slot)
+            simulateImages |= usesPredictedImageState(slot);
+         if (simulateImages)
+         {
+            ++mImageSimulationTick;
+            advanceAimMotion(TickSec);
+            for (U32 slot = 0; slot < MaxMountedImages; ++slot)
+            {
+               if (!usesPredictedImageState(slot))
+                  continue;
+               MountedImage& image = mMountedImageList[slot];
+               if (mDamageState != Enabled)
+                  image.triggerDown = image.altTriggerDown = false;
+               image.motion = mVelocity.lenSquared() > 0.01f;
+               image.wet = mWaterCoverage > 0.4f;
+               if (image.dataBlock->predictionSprintTrigger >= 0)
+                  image.genericTrigger[image.dataBlock->predictionSprintTrigger] = mPose == SprintPose && image.motion;
+               advanceImageSimulation(slot, TickSec);
+            }
+            updateLookAnimation();
+         }
       }
       PROFILE_END();
 
@@ -2755,15 +3321,28 @@ void Player::updateMove(const Move* move)
    // Trigger images
    if (mDamageState == Enabled) 
    {
-      setImageTriggerState( 0, move->trigger[sImageTrigger0] );
+      if (usesPredictedImageState(0))
+         mMountedImageList[0].triggerDown = move->trigger[sImageTrigger0];
+      else
+         setImageTriggerState( 0, move->trigger[sImageTrigger0] );
 
       // If you have a secondary mounted image then
       // send the second trigger to it.  Else give it
       // to the first image as an alt fire.
       if ( getMountedImage( 1 ) )
-         setImageTriggerState( 1, move->trigger[sImageTrigger1] );
+      {
+         if (usesPredictedImageState(1))
+            mMountedImageList[1].triggerDown = move->trigger[sImageTrigger1];
+         else
+            setImageTriggerState( 1, move->trigger[sImageTrigger1] );
+      }
       else
-         setImageAltTriggerState( 0, move->trigger[sImageTrigger1] );
+      {
+         if (usesPredictedImageState(0))
+            mMountedImageList[0].altTriggerDown = move->trigger[sImageTrigger1];
+         else
+            setImageAltTriggerState( 0, move->trigger[sImageTrigger1] );
+      }
    }
 
    // Update current orientation
@@ -3717,6 +4296,11 @@ void Player::updateDamageLevel()
 
 void Player::updateDamageState()
 {
+   if (mDamageState != Enabled)
+   {
+      resetAimMotionState();
+      mImagePresentationQueue.clear();
+   }
    // Become a corpse when we're disabled (dead).
    if (mDamageState == Enabled) {
       mTypeMask &= ~CorpseObjectType;
@@ -5892,7 +6476,7 @@ void Player::getEyeTransform(MatrixF* mat)
       {
          data = image->dataBlock;
          shapeIndex = getImageShapeIndex(*image);
-         if ( data->useEyeNode && (data->animateOnServer || isGhost()) && isFirstPerson() && data->eyeMountNode[shapeIndex] != -1 && data->eyeNode[shapeIndex] != -1 )
+         if ( !data->aimMotionEnabled && data->useEyeNode && (data->animateOnServer || isGhost()) && isFirstPerson() && data->eyeMountNode[shapeIndex] != -1 && data->eyeNode[shapeIndex] != -1 )
          {
             imageIndex = i;
             break;
@@ -5980,7 +6564,7 @@ void Player::getRenderEyeTransform(MatrixF* mat)
       {
          ShapeBaseImageData& data = *image.dataBlock;
          U32 shapeIndex = getImageShapeIndex(image);
-         if ( data.useEyeNode && isFirstPerson() && data.eyeMountNode[shapeIndex] != -1 && data.eyeNode[shapeIndex] != -1 )
+         if ( !data.aimMotionEnabled && data.useEyeNode && isFirstPerson() && data.eyeMountNode[shapeIndex] != -1 && data.eyeNode[shapeIndex] != -1 )
          {
             // Get the eye node's position relative to the eye mount node
             MatrixF mountTransform = image.shapeInstance[shapeIndex]->mNodeTransforms[data.eyeMountNode[shapeIndex]];
@@ -6131,6 +6715,17 @@ void Player::getRenderMuzzleTransform(U32 imageSlot,MatrixF* mat)
 
 void Player::getMuzzleVector(U32 imageSlot,VectorF* vec)
 {
+   if (imageSlot < MaxMountedImages && mMountedImageList[imageSlot].shotContext.active)
+   {
+      *vec = mMountedImageList[imageSlot].shotContext.muzzleVector;
+      return;
+   }
+   AimSolution solution;
+   if (getAimSolution(imageSlot, false, &solution))
+   {
+      *vec = solution.muzzleVector;
+      return;
+   }
    MatrixF mat;
    getMuzzleTransform(imageSlot,&mat);
 
@@ -6156,6 +6751,15 @@ void Player::getMuzzleVector(U32 imageSlot,VectorF* vec)
    mat.getColumn(1,vec);
 }
 
+void Player::getRenderMuzzleVector(U32 imageSlot, VectorF* vec)
+{
+   AimSolution solution;
+   if (getAimSolution(imageSlot, true, &solution))
+      *vec = solution.muzzleVector;
+   else
+      Parent::getRenderMuzzleVector(imageSlot, vec);
+}
+
 void Player::renderMountedImage( U32 imageSlot, TSRenderState &rstate, SceneRenderState *state )
 {
    GFX->pushWorldMatrix();
@@ -6177,7 +6781,9 @@ void Player::renderMountedImage( U32 imageSlot, TSRenderState &rstate, SceneRend
 
    if ( !state->isShadowPass() && isFirstPerson() && (data.useEyeOffset || (data.useEyeNode && data.eyeMountNode[imageShapeIndex] != -1)) ) 
    {
-      if (data.useEyeNode && data.eyeMountNode[imageShapeIndex] != -1)
+      if (data.aimMotionEnabled)
+         getImagePlacementTransform(imageSlot, true, &world);
+      else if (data.useEyeNode && data.eyeMountNode[imageShapeIndex] != -1)
       {
          MatrixF nmat;
          getRenderEyeBaseTransform(&nmat, mDataBlock->mountedImagesBank);
@@ -6192,7 +6798,7 @@ void Player::renderMountedImage( U32 imageSlot, TSRenderState &rstate, SceneRend
          world.mul(nmat,data.eyeOffset);
       }
 
-      if ( imageSlot == 0 )
+      if ( imageSlot == 0 && !data.aimMotionEnabled )
       {
          MatrixF nmat;
          MatrixF smat;
@@ -6503,6 +7109,10 @@ void Player::writePacketData(GameConnection *connection, BitStream *stream)
 {
    Parent::writePacketData(connection, stream);
 
+   writeAimMotionState(stream);
+   stream->writeInt(mPose, NumPoseBits);
+   writeImageSimulationState(connection, stream);
+
    stream->writeInt(mState,NumStateBits);
    if (stream->writeFlag(mState == RecoverState))
       stream->writeInt(mRecoverTicks,PlayerData::RecoverDelayBits);
@@ -6556,6 +7166,16 @@ void Player::writePacketData(GameConnection *connection, BitStream *stream)
 void Player::readPacketData(GameConnection *connection, BitStream *stream)
 {
    Parent::readPacketData(connection, stream);
+
+   readAimMotionState(stream);
+   const U32 pose = stream->readInt(NumPoseBits);
+   if (pose >= PlayerData::AimMotionProfileCount)
+   {
+      connection->setLastError("Invalid procedural player pose.");
+      return;
+   }
+   setPose(Pose(pose));
+   readImageSimulationState(connection, stream);
 
    mState = (ActionState)stream->readInt(NumStateBits);
    if (stream->readFlag())
@@ -6626,6 +7246,10 @@ void Player::readPacketData(GameConnection *connection, BitStream *stream)
 U32 Player::packUpdate(NetConnection *con, U32 mask, BitStream *stream)
 {
    U32 retMask = Parent::packUpdate(con, mask, stream);
+
+   if (stream->writeFlag((mask & (AimMotionMask | InitialUpdateMask)) != 0 &&
+       (getControllingClient() != con || (mask & InitialUpdateMask))))
+      writeAimMotionState(stream);
 
    if (stream->writeFlag((mask & ImpactMask) && !(mask & InitialUpdateMask)))
       stream->writeInt(mImpactSound, PlayerData::ImpactBits);
@@ -6710,6 +7334,9 @@ U32 Player::packUpdate(NetConnection *con, U32 mask, BitStream *stream)
 void Player::unpackUpdate(NetConnection *con, BitStream *stream)
 {
    Parent::unpackUpdate(con,stream);
+
+   if (stream->readFlag())
+      readAimMotionState(stream);
 
    if (stream->readFlag())
       mImpactSound = stream->readInt(PlayerData::ImpactBits);

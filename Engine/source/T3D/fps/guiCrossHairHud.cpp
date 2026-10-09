@@ -28,6 +28,8 @@
 #include "scene/sceneManager.h"
 #include "T3D/gameBase/gameConnection.h"
 #include "T3D/shapeBase.h"
+#include "T3D/player.h"
+#include "gui/3d/guiTSControl.h"
 #include "gfx/gfxDrawUtil.h"
 #include "console/engineAPI.h"
 #include "gui/core/guiOffscreenCanvas.h"
@@ -51,9 +53,15 @@ class GuiCrossHairHud : public GuiBitmapCtrl
    Point2I  mDamageRectSize;
    Point2I  mDamageOffset;
    PlatformTimer* mFrameTime;
+   bool mTrackAim;
+   S32 mImageSlot;
+   Point2I mReticleSize;
+   StringTableEntry mAimViewport;
 
 protected:
    void drawDamage(Point2I offset, F32 damage, F32 opacity);
+   bool resolveAimDisplay(GameConnection* connection, Point2I* point, SimObjectPtr<SceneObject>* target);
+   void drawAimReticle(const Point2I& point);
 
 public:
    GuiCrossHairHud();
@@ -102,6 +110,10 @@ GuiCrossHairHud::GuiCrossHairHud()
    mDamageRectSize.set(50, 4);
    mDamageOffset.set(0,32);
    mFrameTime = PlatformTimer::create();
+   mTrackAim = false;
+   mImageSlot = 0;
+   mReticleSize.set(32, 32);
+   mAimViewport = StringTable->EmptyString();
 }
 
 GuiCrossHairHud::~GuiCrossHairHud()
@@ -118,11 +130,72 @@ void GuiCrossHairHud::initPersistFields()
    addField( "damageRect", TypePoint2I, Offset( mDamageRectSize, GuiCrossHairHud ), "Size for the health bar portion of the control." );
    addField( "damageOffset", TypePoint2I, Offset( mDamageOffset, GuiCrossHairHud ), "Offset for drawing the damage portion of the health control." );
    endGroup("Damage");
+   addGroup("Aim");
+   addField("trackAim", TypeBool, Offset(mTrackAim, GuiCrossHairHud),
+      "Draw a fixed-size marker at the controlled player's nominal aimpoint within this control.");
+   addField("imageSlot", TypeS32, Offset(mImageSlot, GuiCrossHairHud), "Mounted image slot to display.");
+   addField("reticleSize", TypePoint2I, Offset(mReticleSize, GuiCrossHairHud), "Marker size in pixels when trackAim is true.");
+   addField("aimViewport", TypeString, Offset(mAimViewport, GuiCrossHairHud),
+      "GuiTSCtrl used for projection, or empty to find one among this control's ancestors.");
+   endGroup("Aim");
    Parent::initPersistFields();
 }
 
 
 //-----------------------------------------------------------------------------
+
+bool GuiCrossHairHud::resolveAimDisplay(GameConnection* connection, Point2I* point, SimObjectPtr<SceneObject>* target)
+{
+   GuiTSCtrl* viewport = NULL;
+   if (mAimViewport && mAimViewport[0])
+      Sim::findObject(mAimViewport, viewport);
+   else
+      for (GuiControl* parent = getParent(); parent && !viewport; parent = parent->getParent())
+         viewport = dynamic_cast<GuiTSCtrl*>(parent);
+   if (!viewport || !viewport->isAwake() || mImageSlot < 0 || mImageSlot >= ShapeBase::MaxMountedImages)
+      return false;
+   const RectI& rect = viewport->getLastViewportRect();
+   *point = rect.point + rect.extent / 2;
+   *target = NULL;
+   Player* player = dynamic_cast<Player*>(connection->getControlObject());
+   Player::AimSolution solution;
+   if (player && player->getAimSolution(U32(mImageSlot), true, &solution))
+   {
+      Point3F projected;
+      if (!viewport->project(solution.target, &projected))
+         return false;
+      point->set(S32(mRound(projected.x)), S32(mRound(projected.y)));
+      *target = solution.hitObject;
+   }
+   else if (player)
+   {
+      MatrixF camera;
+      connection->getControlCameraTransform(0, &camera);
+      Point3F origin = camera.getPosition();
+      VectorF direction;
+      camera.getColumn(1, &direction);
+      RayInfo hit;
+      player->disableCollision();
+      if (gClientContainer.castRay(origin, origin + direction * gClientSceneGraph->getVisibleDistance(),
+          TerrainObjectType | ShapeBaseObjectType | StaticShapeObjectType, &hit))
+         *target = hit.object;
+      player->enableCollision();
+   }
+   return rect.pointInRect(*point);
+}
+
+void GuiCrossHairHud::drawAimReticle(const Point2I& point)
+{
+   if (mBitmap.isNull() && mBitmapAssetRef.notNull())
+      mBitmap = getBitmap();
+   if (!mBitmap)
+      return;
+   Point2I size(getMax(mReticleSize.x, 1), getMax(mReticleSize.y, 1));
+   GFX->getDrawUtil()->setBitmapModulation(mColor);
+   GFX->getDrawUtil()->drawBitmapStretch(mBitmap, RectI(point - size / 2, size),
+      GFXBitmapFlip_None, mFilterType, false, mAngle);
+   GFX->getDrawUtil()->clearBitmapModulation();
+}
 
 void GuiCrossHairHud::onRender(Point2I offset, const RectI &updateRect)
 {
@@ -135,7 +208,21 @@ void GuiCrossHairHud::onRender(Point2I offset, const RectI &updateRect)
       return;
 
    // Parent render.
-   Parent::onRender(offset,updateRect);
+   if (mTrackAim)
+   {
+      Point2I point;
+      SimObjectPtr<SceneObject> target;
+      if (resolveAimDisplay(conn, &point, &target))
+      {
+         drawAimReticle(point);
+         ShapeBase* shape = dynamic_cast<ShapeBase*>(target.getPointer());
+         if (shape && shape->getShapeName())
+            drawDamage(point + mDamageOffset, shape->getDamageValue(), 1.0f);
+      }
+      renderChildControls(offset, updateRect);
+   }
+   else
+      Parent::onRender(offset,updateRect);
 
    // Get control camera info
    MatrixF cam;
@@ -214,7 +301,7 @@ void GuiCrossHairHud::onRender(Point2I offset, const RectI &updateRect)
       // ShapeBase objects.  Could mask against the object type here
       // and do a static cast if it's a ShapeBaseObjectType, but this
       // isn't a performance situation, so I'll just use dynamic_cast.
-      if (ShapeBase* obj = dynamic_cast<ShapeBase*>(info.object))
+      if (ShapeBase* obj = !mTrackAim ? dynamic_cast<ShapeBase*>(info.object) : NULL)
          if (obj->getShapeName()) {
             offset.x = updateRect.point.x + updateRect.extent.x / 2;
             offset.y = updateRect.point.y + updateRect.extent.y / 2;
