@@ -2844,13 +2844,20 @@ void ShapeBase::setImageSimulationState(U32 slot, U32 newState, bool force)
    image.delayTime = image.state->timeoutValue;
    ShapeBaseImageData::StateData& state = *image.state;
 
-   if (!sameState && image.nextImage != InvalidImagePtr && state.allowImageChange)
+   // Match legacy re-entry: reset the timer and invoke the callback once.
+   if (sameState)
+   {
+      dispatchImageStateScript(slot);
+      return;
+   }
+
+   if (image.nextImage != InvalidImagePtr && state.allowImageChange)
    {
       setImage(slot, image.nextImage, image.nextSkinNameHandle, image.nextLoaded);
       return;
    }
 
-   if (!sameState && (image.delayTime <= 0.0f || !state.waitForTimeout))
+   if (image.delayTime <= 0.0f || !state.waitForTimeout)
    {
       S32 next = state.transition.loaded[image.loaded];
       for (U32 i = 0; next == -1 && i < ShapeBaseImageData::MaxGenericTriggers; ++i)
@@ -2943,26 +2950,31 @@ void ShapeBase::presentImageState(const ImagePresentationEvent& event, bool effe
    updateAnimThread(event.slot, shapeIndex, const_cast<ShapeBaseImageData::StateData*>(previous));
    image.presentedState = event.state;
 
+   // Looping audio belongs to the current state, including after a correction.
+   for (U32 i = image.mSoundSources.size(); i > 0; --i)
+   {
+      SFXSource* source = image.mSoundSources[i - 1];
+      if (!source || source->isLooping())
+      {
+         SFX_DELETE(image.mSoundSources[i - 1]);
+         image.mSoundSources.erase(i - 1);
+      }
+   }
+   SFXTrack* tracks[] = { state.sound ? state.sound->getSFXTrack() : NULL, state.soundTrack };
+   const Point3F velocity = getVelocity();
+   for (U32 i = 0; i < 2; ++i)
+   {
+      SFXTrack* track = tracks[i];
+      if (track && (effects || (track->getDescription() && track->getDescription()->mIsLooping)))
+         image.addSoundSource(SFX->createSource(track, &getRenderTransform(), &velocity));
+   }
+
    if (effects)
    {
       if (state.recoil != ShapeBaseImageData::StateData::NoRecoil)
          onImageRecoil(event.slot, state.recoil);
       if (state.shapeSequence && state.shapeSequence[0])
          onImageStateAnimation(event.slot, state.shapeSequence, state.direction, state.shapeSequenceScale, state.timeoutValue);
-      for (U32 i = image.mSoundSources.size(); i > 0; --i)
-      {
-         SFXSource* source = image.mSoundSources[i - 1];
-         if (!source || source->isLooping())
-         {
-            SFX_DELETE(image.mSoundSources[i - 1]);
-            image.mSoundSources.erase(i - 1);
-         }
-      }
-      const Point3F velocity = getVelocity();
-      if (state.sound)
-         image.addSoundSource(SFX->createSource(state.sound->getSFXTrack(), &getRenderTransform(), &velocity));
-      if (state.soundTrack)
-         image.addSoundSource(SFX->createSource(state.soundTrack, &getRenderTransform(), &velocity));
       if (state.ejectShell)
          ejectShellCasing(event.slot);
       if (state.fire && image.dataBlock->shakeCamera)
@@ -3001,7 +3013,7 @@ void ShapeBase::dispatchImagePresentation()
    }
    mImagePresentationQueue.clear();
 
-   // Corrections can change the final state without a new event. Synchronize animation without effects.
+   // Corrections can change the final state without a new event. Synchronize animation and looping audio.
    for (U32 slot = 0; slot < MaxMountedImages; ++slot)
    {
       MountedImage& image = mMountedImageList[slot];

@@ -2260,8 +2260,11 @@ bool Player::usesPredictedImageState(U32 slot) const
 bool Player::evaluateAimMotion(U32 slot, bool render, AimMotionSample* sample) const
 {
    sample->yaw = sample->pitch = 0.0f;
+   const GameConnection* connection = getControllingClient();
+   const bool firstPerson = connection ?
+      connection->getControlObject() == this && connection->isFirstPerson() : isFirstPerson();
    if (slot >= MaxMountedImages || !mMountedImageList[slot].dataBlock ||
-       !mMountedImageList[slot].dataBlock->aimMotionEnabled || mIsAiControlled || !isFirstPerson())
+       !mMountedImageList[slot].dataBlock->aimMotionEnabled || mIsAiControlled || !firstPerson)
       return false;
    Point3F profile = mAimMotion.profile;
    F32 phase = mAimMotion.phase;
@@ -2501,6 +2504,20 @@ bool Player::validateAimMotion()
    mAimMotion.phase = M_PI_F / 4;
    evaluateAimMotion(0, false, &sample);
    check(sample.yaw > 0 && sample.pitch < 0, "shared angular sample");
+   GameConnection* viewConnection = getControllingClient();
+   MatrixF camera;
+   viewConnection->setFirstPerson(false);
+   viewConnection->getControlCameraTransform(1.0f, &camera);
+   Point3F rayOrigin;
+   VectorF rayDirection;
+   check(!getAimRay(0, false, &rayOrigin, &rayDirection), "third-person server bypasses procedural aim");
+   AimSolution thirdPersonSolution;
+   check(!getAimSolution(0, false, &thirdPersonSolution), "third-person shot falls back to legacy aiming");
+   mNetFlags.set(IsGhost);
+   check(!getAimRay(0, false, &rayOrigin, &rayDirection), "third-person client bypasses procedural aim");
+   mNetFlags.clear(IsGhost);
+   viewConnection->setFirstPerson(true);
+   viewConnection->getControlCameraTransform(1.0f, &camera);
    setDataField(aimScale, NULL, "0");
    setDataField(StringTable->insert("testAccept"), NULL, "1");
    mHead.x = 0;
@@ -2535,6 +2552,26 @@ bool Player::validateAimMotion()
    mHead.x = mDataBlock->minLookAngle + 0.001f;
    setImageState(0, 1, true);
    check(mHead.x == mDataBlock->minLookAngle, "pitch limit clamps recoil");
+
+   // A zero-timeout self-transition must stop after the same-state callback.
+   ShapeBaseImageData::StateData& fireState = mMountedImageList[0].dataBlock->state[1];
+   const F32 savedTimeout = fireState.timeoutValue;
+   const S32 savedTimeoutTransition = fireState.transition.timeout;
+   fireState.timeoutValue = 0;
+   fireState.transition.timeout = 1;
+   const U32 sequenceBeforeSelfTransition = mMountedImageList[0].simulation.shotSequence;
+   setImageState(0, 1, false);
+   check(mMountedImageList[0].simulation.shotSequence == sequenceBeforeSelfTransition + 1,
+      "same-state self-transition invokes one callback");
+   const U32 transitionBeforeSelfTransition = mMountedImageList[0].simulation.transitionSequence;
+   const U32 sequenceBeforeUpdate = mMountedImageList[0].simulation.shotSequence;
+   advanceImageSimulation(0, TickSec);
+   check(mMountedImageList[0].simulation.shotSequence == sequenceBeforeUpdate + 1 &&
+      mMountedImageList[0].simulation.transitionSequence == transitionBeforeSelfTransition,
+      "same-state timeout runs once on the next update");
+   fireState.timeoutValue = savedTimeout;
+   fireState.transition.timeout = savedTimeoutTransition;
+   mMountedImageList[0].delayTime = savedTimeout;
 
    U8 bytes[1500];
    BitStream writer(bytes, sizeof(bytes));
@@ -2593,6 +2630,35 @@ bool Player::validateAimMotion()
       readPacketData(connection, &restore);
    }
    check(mHead.x == 0, "rejected authoritative correction removes speculative kick");
+   // Exercise persistent audio cleanup without requiring an audio device.
+   struct TestSoundSource : SFXSource
+   {
+      TestSoundSource(SFXDescription* description) : SFXSource(NULL, description) {}
+   };
+   SFXDescription* loopDescription = NULL;
+   SFXDescription* oneShotDescription = NULL;
+   Sim::findObject("AudioLoop2D", loopDescription);
+   Sim::findObject("Audio2D", oneShotDescription);
+   const auto createTestSource = [](SFXDescription* description) -> SFXSource*
+   {
+      if (!description)
+         return NULL;
+      SFXSource* source = new TestSoundSource(description);
+      if (!source->registerObject())
+      {
+         delete source;
+         return NULL;
+      }
+      return source;
+   };
+   SimObjectPtr<SFXSource> staleLoop = createTestSource(loopDescription);
+   SimObjectPtr<SFXSource> oneShot = createTestSource(oneShotDescription);
+   mMountedImageList[0].addSoundSource(staleLoop);
+   mMountedImageList[0].addSoundSource(oneShot);
+   const bool audioReady = staleLoop && oneShot && staleLoop->isLooping() && !oneShot->isLooping();
+   dispatchImagePresentation();
+   check(audioReady && !staleLoop && oneShot && oneShot->isPlaying(),
+      "correction stops stale loop and preserves one-shot audio");
    {
       BitStream restore(authoritative, sizeof(authoritative));
       readPacketData(connection, &restore);
