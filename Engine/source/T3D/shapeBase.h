@@ -359,6 +359,10 @@ struct ShapeBaseImageData: public GameBaseData, protected AssetPtrCallback
    //
    bool correctMuzzleVector;        ///< Adjust 1st person firing vector to eye's LOS point?
    bool correctMuzzleVectorTP;      ///< Adjust 3rd person firing vector to camera's LOS point?
+   bool aimMotionEnabled;          ///< Opt in to tick-based player aim and firing prediction.
+   F32 aimMotionScale;             ///< Multiplier for the player's procedural angular motion.
+   F32 cameraRecoilPitch;          ///< Permanent upward camera kick per accepted shot, in degrees.
+   S32 predictionSprintTrigger;   ///< Generic trigger driven by SprintPose, or -1.
    bool firstPerson;                ///< Render the image when in first person?
    bool useFirstPersonShape;        ///< Indicates the special first person shape should be used (true when shapeNameFP and useEyeOffset are defined)
    bool useEyeOffset;               ///< In first person, should we use the eyeTransform?
@@ -750,6 +754,35 @@ public:
       NumDamageStateBits = 2,   ///< Should be log2 of the number of states.
    };
 
+   struct ImageShotKey
+   {
+      U32 generation;
+      U32 tick;
+      U32 sequence;
+   };
+
+   struct ImageShotContext
+   {
+      bool active;
+      bool confirmed;
+      ImageShotKey key;
+      Point3F muzzlePoint;
+      VectorF muzzleVector;
+      ImageShotContext() : active(false), confirmed(false), key{ 0, 0, 0 },
+         muzzlePoint(0, 0, 0), muzzleVector(0, 1, 0) {}
+   };
+
+   /// Only simulation values are restored during move replay; presentation is not rewound.
+   struct ImageSimulationState
+   {
+      U32 generation;
+      U32 shotSequence;
+      U32 acceptedSequence;
+      U32 transitionSequence;
+      S32 predictionAmmo;          ///< -1 means unlimited; otherwise shots remaining.
+      ImageSimulationState() : generation(0), shotSequence(0), acceptedSequence(0), transitionSequence(0), predictionAmmo(0) {}
+   };
+
 protected:
    ShapeBaseData*    mDataBlock;                ///< Datablock
    bool              mIsAiControlled;           ///< Is this object AI controlled?
@@ -804,6 +837,9 @@ protected:
    /// An image mounted on a shapebase.
    struct MountedImage {
       ShapeBaseImageData* dataBlock;
+      ImageSimulationState simulation;
+      ImageShotContext shotContext;
+      U32 presentedState;
       ShapeBaseImageData::StateData *state;
       ShapeBaseImageData* nextImage;
       NetStringHandle skinNameHandle;
@@ -903,6 +939,23 @@ protected:
       void updateDoAnimateAllShapes(const ShapeBase* owner);
    };
    MountedImage mMountedImageList[MaxMountedImages];
+
+   struct ImagePresentationEvent
+   {
+      U32 slot;
+      U32 state;
+      U32 previousState;
+      U32 generation;
+      U32 tick;
+      U32 sequence;
+   };
+   Vector<ImagePresentationEvent> mImagePresentationQueue;
+   Vector<ImagePresentationEvent> mImagePresentationHistory;
+   U32 mImageSimulationTick;
+   bool mRestoringImageSimulation;
+   bool mAdvancingImageSimulation;
+   U32 mImageTransitionDepth;
+   U32 mImageTransitionBudget;
 
    /// @}
 
@@ -1109,6 +1162,20 @@ protected:
    /// @param   imageSlot   Image slot id
    /// @param   dt          Change in time since last state update
    void updateImageState(U32 imageSlot,F32 dt);
+
+   virtual bool usesPredictedImageState(U32 imageSlot) const { return false; }
+   virtual void onImageShotCommitted(U32 imageSlot, const ImageShotKey& key) {}
+   void advanceImageSimulation(U32 imageSlot, F32 dt);
+   void updateProceduralImageSpin(U32 imageSlot);
+   void setImageSimulationState(U32 imageSlot, U32 state, bool force);
+   void presentImageState(const ImagePresentationEvent& event, bool effects);
+   void queueImagePresentation(U32 imageSlot, U32 previousState);
+   void dispatchImagePresentation();
+   void dispatchImageStateScript(U32 imageSlot);
+   void beginImageShot(U32 imageSlot);
+   void finishImageShot(U32 imageSlot);
+   void writeImageSimulationState(GameConnection* connection, BitStream* stream);
+   void readImageSimulationState(GameConnection* connection, BitStream* stream);
 
    /// Start up the particle emitter for the this shapebase
    /// @param   image   Mounted image
@@ -1604,6 +1671,9 @@ public:
    /// @param   vec   Muzzle vector (out)
    virtual void getMuzzleVector(U32 imageSlot,VectorF* vec);
 
+   bool confirmImageShot(U32 imageSlot);
+   void setImagePredictionAmmo(U32 imageSlot, S32 count);
+
    /// Gets the point of the muzzle of the image
    /// @param   imageSlot   Image slot
    /// @param   pos   Muzzle point (out)
@@ -1707,6 +1777,11 @@ public:
    virtual void getRenderImageTransform(U32 index,S32 node, MatrixF* mat);
    virtual void getRenderImageTransform(U32 index, StringTableEntry nodeName, MatrixF* mat);
    virtual void getRenderMuzzleVector(U32 imageSlot,VectorF* vec);
+
+   virtual void getImagePlacementTransform(U32 imageSlot, bool render, MatrixF* mat);
+   virtual void getImageAimOffset(U32 imageSlot, bool render, MatrixF* mat) { mat->identity(); }
+   bool getCorrectedAimFromRay(const MatrixF& muzzleMat, const Point3F& origin,
+      const VectorF& direction, VectorF* result, Point3F* target = NULL);
    virtual void getRenderMuzzlePoint(U32 imageSlot,Point3F* pos);
    virtual void getRenderEyeTransform(MatrixF* mat);
    virtual void getRenderEyeBaseTransform(MatrixF* mat, bool includeBank);

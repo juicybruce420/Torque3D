@@ -171,6 +171,10 @@ ShapeBaseImageData::ShapeBaseImageData()
    eyeOffset.identity();
    correctMuzzleVector = true;
    correctMuzzleVectorTP = true;
+   aimMotionEnabled = false;
+   aimMotionScale = 1.0f;
+   cameraRecoilPitch = 0.0f;
+   predictionSprintTrigger = -1;
    firstPerson = true;
    useFirstPersonShape = false;
    useEyeOffset = false;
@@ -405,6 +409,13 @@ bool ShapeBaseImageData::onAdd()
 
 bool ShapeBaseImageData::preload(bool server, String &errorStr)
 {
+   if (!(aimMotionScale >= 0.0f && aimMotionScale <= 1000.0f) ||
+       !(cameraRecoilPitch >= 0.0f && cameraRecoilPitch <= 90.0f) ||
+       predictionSprintTrigger < -1 || predictionSprintTrigger >= MaxGenericTriggers)
+   {
+      errorStr = "Invalid aimMotionScale (0..1000), cameraRecoilPitch (0..90 degrees), or predictionSprintTrigger (-1..3).";
+      return false;
+   }
    if (!Parent::preload(server, errorStr))
       return false;
 
@@ -740,6 +751,17 @@ void ShapeBaseImageData::initPersistFields()
    addField( "correctMuzzleVectorTP", TypeBool,  Offset(correctMuzzleVectorTP, ShapeBaseImageData),
       "@brief Flag to adjust the aiming vector to the camera's LOS point when in 3rd person view.\n\n"
       "@see ShapeBase::getMuzzleVector()" );
+
+   addGroup("Procedural Aim");
+   addField("aimMotionEnabled", TypeBool, Offset(aimMotionEnabled, ShapeBaseImageData),
+      "Use tick-based player aim motion, firing prediction and accepted-shot camera recoil.");
+   addField("aimMotionScale", TypeF32, Offset(aimMotionScale, ShapeBaseImageData),
+      "Weapon multiplier for procedural sway (0..1000). Zero disables sway only.");
+   addField("cameraRecoilPitch", TypeF32, Offset(cameraRecoilPitch, ShapeBaseImageData),
+      "Permanent upward view kick per accepted shot, in degrees (0..90).");
+   addField("predictionSprintTrigger", TypeS32, Offset(predictionSprintTrigger, ShapeBaseImageData),
+      "Generic trigger driven by player sprint pose for prediction; -1 disables (default).");
+   endGroup("Procedural Aim");
    addFieldV( "mass", TypeRangedF32, Offset(mass, ShapeBaseImageData), &CommonValidators::PositiveFloat,
       "@brief Mass of this Image.\n\n"
       "This is added to the total mass of the ShapeBase object." );
@@ -997,6 +1019,10 @@ void ShapeBaseImageData::packData(BitStream* stream)
 
    stream->writeFlag(correctMuzzleVector);
    stream->writeFlag(correctMuzzleVectorTP);
+   stream->writeFlag(aimMotionEnabled);
+   stream->write(aimMotionScale);
+   stream->write(cameraRecoilPitch);
+   stream->write(predictionSprintTrigger);
    stream->writeFlag(firstPerson);
    stream->write(mass);
    stream->writeFlag(usesEnergy);
@@ -1185,6 +1211,10 @@ void ShapeBaseImageData::unpackData(BitStream* stream)
 
    correctMuzzleVector = stream->readFlag();
    correctMuzzleVectorTP = stream->readFlag();
+   aimMotionEnabled = stream->readFlag();
+   stream->read(&aimMotionScale);
+   stream->read(&cameraRecoilPitch);
+   stream->read(&predictionSprintTrigger);
    firstPerson = stream->readFlag();
    stream->read(&mass);
    usesEnergy = stream->readFlag();
@@ -1373,6 +1403,7 @@ void ShapeBaseImageData::inspectPostApply()
 
 ShapeBase::MountedImage::MountedImage()
 {
+   presentedState = U32(-1);
    for (U32 i=0; i<ShapeBaseImageData::MaxShapes; ++i)
    {
       shapeInstance[i] = 0;
@@ -1785,6 +1816,11 @@ void ShapeBase::getMuzzleVector(U32 imageSlot,VectorF* vec)
 
 void ShapeBase::getMuzzlePoint(U32 imageSlot,Point3F* pos)
 {
+   if (imageSlot < MaxMountedImages && mMountedImageList[imageSlot].shotContext.active)
+   {
+      *pos = mMountedImageList[imageSlot].shotContext.muzzlePoint;
+      return;
+   }
    MatrixF mat;
    getMuzzleTransform(imageSlot,&mat);
    mat.getColumn(3,pos);
@@ -1861,8 +1897,52 @@ void ShapeBase::getMountTransform( S32 index, const MatrixF &xfm, MatrixF *outMa
    Parent::getMountTransform( index, xfm, outMat );      
 }
 
+void ShapeBase::getImagePlacementTransform(U32 imageSlot, bool render, MatrixF* mat)
+{
+   MountedImage& image = mMountedImageList[imageSlot];
+   if (!image.dataBlock)
+   {
+      *mat = render ? getRenderTransform() : getTransform();
+      return;
+   }
+   ShapeBaseImageData& data = *image.dataBlock;
+   const U32 shapeIndex = getImageShapeIndex(image);
+   if (isFirstPerson() && (data.useEyeOffset || (data.useEyeNode && data.eyeMountNode[shapeIndex] != -1)))
+   {
+      if (render && isGhost())
+         getRenderEyeBaseTransform(mat, mDataBlock->mountedImagesBank);
+      else
+         getEyeBaseTransform(mat, mDataBlock->mountedImagesBank);
+      MatrixF aim;
+      getImageAimOffset(imageSlot, render, &aim);
+      mat->mul(aim);
+      if (data.useEyeNode && data.eyeMountNode[shapeIndex] != -1)
+      {
+         image.shapeInstance[shapeIndex]->animate();
+         MatrixF mount = image.shapeInstance[shapeIndex]->mNodeTransforms[data.eyeMountNode[shapeIndex]];
+         mount.affineInverse();
+         mat->mul(mount);
+      }
+      else
+         mat->mul(data.eyeOffset);
+   }
+   else
+   {
+      if (render && isGhost())
+         getRenderMountTransform(0.0f, data.mountPoint, MatrixF::Identity, mat);
+      else
+         getMountTransform(data.mountPoint, MatrixF::Identity, mat);
+      mat->mul(data.mountTransform[shapeIndex]);
+   }
+}
+
 void ShapeBase::getImageTransform(U32 imageSlot,MatrixF* mat)
 {
+   if (mMountedImageList[imageSlot].dataBlock && mMountedImageList[imageSlot].dataBlock->aimMotionEnabled && isFirstPerson())
+   {
+      getImagePlacementTransform(imageSlot, false, mat);
+      return;
+   }
    // Image transform in world space
    MountedImage& image = mMountedImageList[imageSlot];
    if (image.dataBlock) {
@@ -1895,6 +1975,14 @@ void ShapeBase::getImageTransform(U32 imageSlot,MatrixF* mat)
 
 void ShapeBase::getImageTransform(U32 imageSlot,S32 node,MatrixF* mat)
 {
+   if (mMountedImageList[imageSlot].dataBlock && mMountedImageList[imageSlot].dataBlock->aimMotionEnabled && isFirstPerson())
+   {
+      MountedImage& image = mMountedImageList[imageSlot];
+      getImagePlacementTransform(imageSlot, false, mat);
+      if (node != -1)
+         mat->mul(image.shapeInstance[getImageShapeIndex(image)]->mNodeTransforms[node]);
+      return;
+   }
    // Image transform in world space
    MountedImage& image = mMountedImageList[imageSlot];
    if (image.dataBlock)
@@ -1989,6 +2077,12 @@ void ShapeBase::getRenderMountTransform( F32 delta, S32 mountPoint, const Matrix
 
 void ShapeBase::getRenderImageTransform( U32 imageSlot, MatrixF* mat, bool noEyeOffset )
 {
+   if (!noEyeOffset && mMountedImageList[imageSlot].dataBlock &&
+       mMountedImageList[imageSlot].dataBlock->aimMotionEnabled && isFirstPerson())
+   {
+      getImagePlacementTransform(imageSlot, true, mat);
+      return;
+   }
    // Image transform in world space
    MountedImage& image = mMountedImageList[imageSlot];
    if (image.dataBlock) 
@@ -2021,6 +2115,14 @@ void ShapeBase::getRenderImageTransform( U32 imageSlot, MatrixF* mat, bool noEye
 
 void ShapeBase::getRenderImageTransform(U32 imageSlot,S32 node,MatrixF* mat)
 {
+   if (mMountedImageList[imageSlot].dataBlock && mMountedImageList[imageSlot].dataBlock->aimMotionEnabled && isFirstPerson())
+   {
+      MountedImage& image = mMountedImageList[imageSlot];
+      getImagePlacementTransform(imageSlot, true, mat);
+      if (node != -1)
+         mat->mul(image.shapeInstance[getImageShapeIndex(image)]->mNodeTransforms[node]);
+      return;
+   }
    // Image transform in world space
    MountedImage& image = mMountedImageList[imageSlot];
    if (image.dataBlock)
@@ -2138,7 +2240,6 @@ S32 ShapeBase::getNodeIndex(U32 imageSlot,StringTableEntry nodeName)
 // caller know if we actually modified the result.
 bool ShapeBase::getCorrectedAim(const MatrixF& muzzleMat, VectorF* result)
 {
-   F32 pullInD = sFullCorrectionDistance;
    const F32 maxAdjD = 500;
 
    VectorF  aheadVec(0, maxAdjD, 0);
@@ -2155,7 +2256,15 @@ bool ShapeBase::getCorrectedAim(const MatrixF& muzzleMat, VectorF* result)
 
    camMat.getColumn(3, &camPos);
    camMat.mulV(aheadVec);
-   Point3F  aheadPoint = (camPos + aheadVec);
+   aheadVec.normalizeSafe();
+   return getCorrectedAimFromRay(muzzleMat, camPos, aheadVec, result);
+}
+
+bool ShapeBase::getCorrectedAimFromRay(const MatrixF& muzzleMat, const Point3F& camPos,
+   const VectorF& direction, VectorF* result, Point3F* target)
+{
+   const F32 pullInD = sFullCorrectionDistance;
+   const Point3F aheadPoint = camPos + direction * 500.0f;
 
    // Should we check if muzzle point is really close to camera?  Does that happen?
    Point3F  muzzlePos;
@@ -2185,6 +2294,8 @@ bool ShapeBase::getCorrectedAim(const MatrixF& muzzleMat, VectorF* result)
    }
 
    VectorF  muzzleToCollide = (collidePoint - muzzlePos);
+   if (target)
+      *target = collidePoint;
    lenSq = muzzleToCollide.lenSquared();
    if (lenSq > 0.04)
    {
@@ -2424,6 +2535,12 @@ void ShapeBase::resetImageSlot(U32 imageSlot)
 
    // Clear out current image
    MountedImage& image = mMountedImageList[imageSlot];
+   ++image.simulation.generation;
+   image.simulation.shotSequence = image.simulation.transitionSequence = 0;
+   image.simulation.acceptedSequence = 0;
+   image.simulation.predictionAmmo = 0;
+   image.shotContext.active = image.shotContext.confirmed = false;
+   image.presentedState = U32(-1);
    for (U32 i=0; i<ShapeBaseImageData::MaxShapes; ++i)
    {
       delete image.shapeInstance[i];
@@ -2588,11 +2705,497 @@ bool ShapeBase::hasImageState(U32 imageSlot, const char* state)
    return false;
 }
 
+void ShapeBase::advanceImageSimulation(U32 slot, F32 dt)
+{
+   const bool wasAdvancing = mAdvancingImageSimulation;
+   mAdvancingImageSimulation = true;
+   mImageTransitionBudget = 128;
+   updateImageState(slot, dt);
+   if (isServerObject() && mMountedImageList[slot].dataBlock)
+      updateImageAnimation(slot, dt);
+   mAdvancingImageSimulation = wasAdvancing;
+}
+
+void ShapeBase::beginImageShot(U32 slot)
+{
+   MountedImage& image = mMountedImageList[slot];
+   ImageShotContext& context = image.shotContext;
+   context.active = false;
+   context.confirmed = false;
+   context.key.generation = image.simulation.generation;
+   context.key.tick = mImageSimulationTick;
+   context.key.sequence = ++image.simulation.shotSequence;
+   getMuzzlePoint(slot, &context.muzzlePoint);
+   getMuzzleVector(slot, &context.muzzleVector);
+   context.active = true;
+}
+
+void ShapeBase::updateProceduralImageSpin(U32 slot)
+{
+   MountedImage& image = mMountedImageList[slot];
+   if (!image.dataBlock || !image.state)
+      return;
+   const ShapeBaseImageData::StateData& state = *image.state;
+   F32 scale = 0;
+   switch (state.spin)
+   {
+      case ShapeBaseImageData::StateData::IgnoreSpin: return;
+      case ShapeBaseImageData::StateData::NoSpin: break;
+      case ShapeBaseImageData::StateData::FullSpin: scale = 1; break;
+      case ShapeBaseImageData::StateData::SpinUp:
+         scale = state.timeoutValue > 0 ? 1 - image.delayTime / state.timeoutValue : 1;
+         break;
+      case ShapeBaseImageData::StateData::SpinDown:
+         scale = state.timeoutValue > 0 ? image.delayTime / state.timeoutValue : 0;
+         break;
+   }
+   for (U32 i = 0; i < ShapeBaseImageData::MaxShapes; ++i)
+      if (image.spinThread[i])
+         image.shapeInstance[i]->setTimeScale(image.spinThread[i], mClampF(scale, 0, 1));
+}
+
+bool ShapeBase::confirmImageShot(U32 slot)
+{
+   if (!isServerObject() || slot >= MaxMountedImages)
+      return false;
+   MountedImage& image = mMountedImageList[slot];
+   if (!image.dataBlock || !image.dataBlock->aimMotionEnabled || !image.shotContext.active ||
+       image.shotContext.key.generation != image.simulation.generation)
+      return false;
+   image.shotContext.confirmed = true;
+   return true;
+}
+
+void ShapeBase::finishImageShot(U32 slot)
+{
+   MountedImage& image = mMountedImageList[slot];
+   const ImageShotContext context = image.shotContext;
+   image.shotContext.active = false;
+   if (context.confirmed && image.dataBlock && context.key.generation == image.simulation.generation)
+   {
+      image.simulation.acceptedSequence = context.key.sequence;
+      onImageShotCommitted(slot, context.key);
+   }
+}
+
+void ShapeBase::setImagePredictionAmmo(U32 slot, S32 count)
+{
+   if (!isServerObject() || slot >= MaxMountedImages || count < -1)
+      return;
+   MountedImage& image = mMountedImageList[slot];
+   image.simulation.predictionAmmo = count;
+   if (image.dataBlock && image.dataBlock->aimMotionEnabled)
+      setMaskBits(ImageMaskN << slot);
+}
+
+void ShapeBase::dispatchImageStateScript(U32 slot)
+{
+   MountedImage& image = mMountedImageList[slot];
+   ShapeBaseImageData::StateData& state = *image.state;
+   const bool shot = state.fire || state.altFire;
+   const ImageShotContext previousContext = image.shotContext;
+   if (shot)
+      beginImageShot(slot);
+
+   if (isServerObject())
+   {
+      if (state.script && state.script[0])
+         scriptCallback(slot, state.script);
+   }
+   else if (shot)
+   {
+      // Predict only readiness and recoil. Inventory, projectile creation and damage stay on the server.
+      image.shotContext.confirmed = image.dataBlock->usesEnergy || image.simulation.predictionAmmo != 0;
+      if (image.shotContext.confirmed && image.simulation.predictionAmmo > 0)
+      {
+         --image.simulation.predictionAmmo;
+         image.ammo = image.simulation.predictionAmmo != 0;
+      }
+   }
+   if (shot)
+   {
+      finishImageShot(slot);
+      image.shotContext = previousContext;
+   }
+}
+
+void ShapeBase::setImageSimulationState(U32 slot, U32 newState, bool force)
+{
+   if (newState >= ShapeBaseImageData::MaxStates || !mMountedImageList[slot].dataBlock)
+      return;
+   if (!mImageTransitionBudget || mImageTransitionDepth >= 64)
+   {
+      Con::warnf("ShapeBase %u: procedural image %u exceeded its transition budget.", getId(), slot);
+      return;
+   }
+   --mImageTransitionBudget;
+   struct TransitionGuard
+   {
+      U32& depth;
+      TransitionGuard(U32& value) : depth(value) { ++depth; }
+      ~TransitionGuard() { --depth; }
+   } guard(mImageTransitionDepth);
+
+   MountedImage& image = mMountedImageList[slot];
+   const U32 previousState = U32(image.state - image.dataBlock->state);
+   const F32 previousDelay = image.delayTime;
+   const bool sameState = previousState == newState && !force;
+   image.state = &image.dataBlock->state[newState];
+   image.delayTime = image.state->timeoutValue;
+   ShapeBaseImageData::StateData& state = *image.state;
+
+   // Match legacy re-entry: reset the timer and invoke the callback once.
+   if (sameState)
+   {
+      dispatchImageStateScript(slot);
+      return;
+   }
+
+   if (image.nextImage != InvalidImagePtr && state.allowImageChange)
+   {
+      setImage(slot, image.nextImage, image.nextSkinNameHandle, image.nextLoaded);
+      return;
+   }
+
+   if (image.delayTime <= 0.0f || !state.waitForTimeout)
+   {
+      S32 next = state.transition.loaded[image.loaded];
+      for (U32 i = 0; next == -1 && i < ShapeBaseImageData::MaxGenericTriggers; ++i)
+         next = state.transition.genericTrigger[i][image.genericTrigger[i]];
+      if (next == -1) next = state.transition.ammo[image.ammo];
+      if (next == -1) next = state.transition.target[image.target];
+      if (next == -1) next = state.transition.wet[image.wet];
+      if (next == -1) next = state.transition.motion[image.motion];
+      if (next == -1) next = state.transition.trigger[image.triggerDown];
+      if (next == -1) next = state.transition.altTrigger[image.altTriggerDown];
+      if (next != -1)
+      {
+         setImageSimulationState(slot, next, false);
+         return;
+      }
+   }
+
+   if (state.loaded != ShapeBaseImageData::StateData::IgnoreLoaded)
+      image.loaded = state.loaded == ShapeBaseImageData::StateData::Loaded;
+   const ShapeBaseImageData::StateData::SpinState previousSpin = image.dataBlock->state[previousState].spin;
+   if (state.timeoutValue > 0 &&
+       ((state.spin == ShapeBaseImageData::StateData::SpinUp && previousSpin == ShapeBaseImageData::StateData::SpinDown) ||
+        (state.spin == ShapeBaseImageData::StateData::SpinDown && previousSpin == ShapeBaseImageData::StateData::SpinUp)))
+      image.delayTime *= 1 - mClampF(previousDelay / state.timeoutValue, 0, 1);
+   ++image.simulation.transitionSequence;
+   if (state.fire) image.fireCount = (image.fireCount + 1) & 7;
+   if (state.altFire) image.altFireCount = (image.altFireCount + 1) & 7;
+   if (state.reload) image.reloadCount = (image.reloadCount + 1) & 7;
+   if (isServerObject())
+   {
+      setMaskBits(ImageMaskN << slot);
+      updateAnimThread(slot, getImageShapeIndex(image), &image.dataBlock->state[previousState]);
+      if (state.recoil != ShapeBaseImageData::StateData::NoRecoil)
+         onImageRecoil(slot, state.recoil);
+      if (state.shapeSequence && state.shapeSequence[0])
+         onImageStateAnimation(slot, state.shapeSequence, state.direction, state.shapeSequenceScale, state.timeoutValue);
+   }
+   else
+      queueImagePresentation(slot, previousState);
+
+   const U32 generation = image.simulation.generation;
+   dispatchImageStateScript(slot);
+   if (!image.dataBlock || image.simulation.generation != generation)
+      return;
+   if (image.delayTime <= 0.0f && image.state->transition.timeout != -1)
+      setImageSimulationState(slot, image.state->transition.timeout, false);
+}
+
+void ShapeBase::queueImagePresentation(U32 slot, U32 previousState)
+{
+   if (!isGhost() || mRestoringImageSimulation)
+      return;
+   const MountedImage& image = mMountedImageList[slot];
+   ImagePresentationEvent event;
+   event.slot = slot;
+   event.state = U32(image.state - image.dataBlock->state);
+   event.previousState = previousState;
+   event.generation = image.simulation.generation;
+   event.tick = mImageSimulationTick;
+   event.sequence = image.simulation.transitionSequence;
+   mImagePresentationQueue.push_back(event);
+}
+
+void ShapeBase::presentImageState(const ImagePresentationEvent& event, bool effects)
+{
+   MountedImage& image = mMountedImageList[event.slot];
+   if (!image.dataBlock || image.simulation.generation != event.generation)
+      return;
+   ShapeBaseImageData::StateData* savedState = image.state;
+   image.state = &image.dataBlock->state[event.state];
+   ShapeBaseImageData::StateData& state = *image.state;
+   const U32 shapeIndex = getImageShapeIndex(image);
+   const ShapeBaseImageData::StateData* previous = event.previousState < ShapeBaseImageData::MaxStates ?
+      &image.dataBlock->state[event.previousState] : NULL;
+
+   // State simulation never manipulates client animation threads. Do that once here, after replay.
+   for (U32 i = 0; i < ShapeBaseImageData::MaxShapes; ++i)
+   {
+      if (image.animThread[i] && image.animThread[i]->hasSequence() &&
+          image.animThread[i]->getSequence()->isCyclic() &&
+          (state.sequenceNeverTransition || !(state.sequenceTransitionIn || (previous && previous->sequenceTransitionOut))))
+      {
+         image.shapeInstance[i]->setPos(image.animThread[i], 0);
+         image.shapeInstance[i]->setTimeScale(image.animThread[i], 0);
+      }
+      if (image.flashThread[i])
+         image.shapeInstance[i]->setPos(image.flashThread[i], 0);
+   }
+   onImageAnimThreadChange(event.slot, shapeIndex, const_cast<ShapeBaseImageData::StateData*>(previous), NULL, 0, 0, true);
+   updateAnimThread(event.slot, shapeIndex, const_cast<ShapeBaseImageData::StateData*>(previous));
+   image.presentedState = event.state;
+
+   // Looping audio belongs to the current state, including after a correction.
+   for (U32 i = image.mSoundSources.size(); i > 0; --i)
+   {
+      SFXSource* source = image.mSoundSources[i - 1];
+      if (!source || source->isLooping())
+      {
+         SFX_DELETE(image.mSoundSources[i - 1]);
+         image.mSoundSources.erase(i - 1);
+      }
+   }
+   SFXTrack* tracks[] = { state.sound ? state.sound->getSFXTrack() : NULL, state.soundTrack };
+   const Point3F velocity = getVelocity();
+   for (U32 i = 0; i < 2; ++i)
+   {
+      SFXTrack* track = tracks[i];
+      if (track && (effects || (track->getDescription() && track->getDescription()->mIsLooping)))
+         image.addSoundSource(SFX->createSource(track, &getRenderTransform(), &velocity));
+   }
+
+   if (effects)
+   {
+      if (state.recoil != ShapeBaseImageData::StateData::NoRecoil)
+         onImageRecoil(event.slot, state.recoil);
+      if (state.shapeSequence && state.shapeSequence[0])
+         onImageStateAnimation(event.slot, state.shapeSequence, state.direction, state.shapeSequenceScale, state.timeoutValue);
+      if (state.ejectShell)
+         ejectShellCasing(event.slot);
+      if (state.fire && image.dataBlock->shakeCamera)
+         shakeCamera(event.slot);
+      if (state.emitter)
+         startImageEmitter(image, state);
+      if (state.fire || state.altFire)
+         image.lightStart = Sim::getCurrentTime();
+   }
+   image.state = savedState;
+}
+
+void ShapeBase::dispatchImagePresentation()
+{
+   for (U32 i = 0; i < mImagePresentationQueue.size(); ++i)
+   {
+      const ImagePresentationEvent& event = mImagePresentationQueue[i];
+      bool seen = false;
+      for (U32 j = 0; j < mImagePresentationHistory.size(); ++j)
+      {
+         const ImagePresentationEvent& old = mImagePresentationHistory[j];
+         if (old.slot == event.slot && old.generation == event.generation && old.tick == event.tick &&
+             old.sequence == event.sequence && old.state == event.state)
+         {
+            seen = true;
+            break;
+         }
+      }
+      if (!seen)
+      {
+         presentImageState(event, true);
+         if (mImagePresentationHistory.size() >= 4096)
+            mImagePresentationHistory.erase(U32(0));
+         mImagePresentationHistory.push_back(event);
+      }
+   }
+   mImagePresentationQueue.clear();
+
+   // Corrections can change the final state without a new event. Synchronize animation and looping audio.
+   for (U32 slot = 0; slot < MaxMountedImages; ++slot)
+   {
+      MountedImage& image = mMountedImageList[slot];
+      if (!usesPredictedImageState(slot) || !image.state)
+         continue;
+      const U32 state = U32(image.state - image.dataBlock->state);
+      if (image.presentedState != state)
+      {
+         ImagePresentationEvent event = { slot, state, image.presentedState, image.simulation.generation,
+            mImageSimulationTick, image.simulation.transitionSequence };
+         presentImageState(event, false);
+      }
+   }
+}
+
+void ShapeBase::writeImageSimulationState(GameConnection* connection, BitStream* stream)
+{
+   stream->write(mImageSimulationTick);
+   for (U32 slot = 0; slot < MaxMountedImages; ++slot)
+   {
+      const MountedImage& image = mMountedImageList[slot];
+      if (!stream->writeFlag(image.dataBlock && image.dataBlock->aimMotionEnabled))
+         continue;
+      stream->writeInt(image.dataBlock->getId() - DataBlockObjectIdFirst, DataBlockObjectIdBitSize);
+      // Use literal strings here: these values also participate in the move checksum.
+      stream->writeString(image.skinNameHandle.getString());
+      stream->writeString(image.scriptAnimPrefix.getString());
+      if (stream->writeFlag(image.nextImage != InvalidImagePtr))
+      {
+         if (stream->writeFlag(image.nextImage != NULL))
+            stream->writeInt(image.nextImage->getId() - DataBlockObjectIdFirst, DataBlockObjectIdBitSize);
+         stream->writeString(image.nextSkinNameHandle.getString());
+         stream->writeFlag(image.nextLoaded);
+      }
+      stream->write(image.simulation.generation);
+      stream->write(image.simulation.shotSequence);
+      stream->write(image.simulation.acceptedSequence);
+      stream->write(image.simulation.transitionSequence);
+      stream->write(image.simulation.predictionAmmo);
+      stream->writeInt(U32(image.state - image.dataBlock->state), ShapeBaseImageData::NumStateBits);
+      stream->write(image.delayTime);
+      stream->write(image.rDT);
+      stream->writeInt(image.fireCount, 3);
+      stream->writeInt(image.altFireCount, 3);
+      stream->writeInt(image.reloadCount, 3);
+      stream->writeFlag(image.loaded);
+      stream->writeFlag(image.ammo);
+      stream->writeFlag(image.target);
+      stream->writeFlag(image.wet);
+      stream->writeFlag(image.motion);
+      stream->writeFlag(image.triggerDown);
+      stream->writeFlag(image.altTriggerDown);
+      for (U32 i = 0; i < ShapeBaseImageData::MaxGenericTriggers; ++i)
+         stream->writeFlag(image.genericTrigger[i]);
+   }
+}
+
+void ShapeBase::readImageSimulationState(GameConnection* connection, BitStream* stream)
+{
+   struct RestoreGuard
+   {
+      bool& restoring;
+      bool previous;
+      RestoreGuard(bool& value) : restoring(value), previous(value) { restoring = true; }
+      ~RestoreGuard() { restoring = previous; }
+   } guard(mRestoringImageSimulation);
+   mImagePresentationQueue.clear();
+   stream->read(&mImageSimulationTick);
+   for (U32 slot = 0; slot < MaxMountedImages; ++slot)
+   {
+      if (!stream->readFlag())
+      {
+         if (mMountedImageList[slot].dataBlock && mMountedImageList[slot].dataBlock->aimMotionEnabled)
+         {
+            NetStringHandle emptySkin;
+            setImage(slot, NULL, emptySkin);
+         }
+         continue;
+      }
+      ShapeBaseImageData* data = NULL;
+      const SimObjectId id = stream->readInt(DataBlockObjectIdBitSize) + DataBlockObjectIdFirst;
+      if (!Sim::findObject(id, data) || !data->aimMotionEnabled)
+      {
+         connection->setLastError("Invalid procedural image datablock.");
+         return;
+      }
+      char text[256];
+      stream->readString(text);
+      NetStringHandle skin(text);
+      stream->readString(text);
+      NetStringHandle prefix(text);
+      ShapeBaseImageData* next = InvalidImagePtr;
+      NetStringHandle nextSkin;
+      bool nextLoaded = false;
+      if (stream->readFlag())
+      {
+         next = NULL;
+         if (stream->readFlag())
+         {
+            const SimObjectId nextId = stream->readInt(DataBlockObjectIdBitSize) + DataBlockObjectIdFirst;
+            if (!Sim::findObject(nextId, next))
+            {
+               connection->setLastError("Invalid pending procedural image datablock.");
+               return;
+            }
+         }
+         stream->readString(text);
+         nextSkin = NetStringHandle(text);
+         nextLoaded = stream->readFlag();
+      }
+      MountedImage& image = mMountedImageList[slot];
+      if (image.dataBlock != data || image.skinNameHandle != skin)
+         setImage(slot, data, skin);
+      if (image.scriptAnimPrefix != prefix)
+         image.presentedState = U32(-1);
+      image.scriptAnimPrefix = prefix;
+      image.nextImage = next;
+      image.nextSkinNameHandle = nextSkin;
+      image.nextLoaded = nextLoaded;
+      const U32 previousGeneration = image.simulation.generation;
+      stream->read(&image.simulation.generation);
+      if (previousGeneration != image.simulation.generation)
+         image.presentedState = U32(-1);
+      stream->read(&image.simulation.shotSequence);
+      stream->read(&image.simulation.acceptedSequence);
+      stream->read(&image.simulation.transitionSequence);
+      stream->read(&image.simulation.predictionAmmo);
+      const U32 state = stream->readInt(ShapeBaseImageData::NumStateBits);
+      if (state >= ShapeBaseImageData::MaxStates || !data->state[state].name)
+      {
+         connection->setLastError("Invalid procedural image state.");
+         return;
+      }
+      image.state = &data->state[state];
+      image.shotContext.active = false;
+      stream->read(&image.delayTime);
+      stream->read(&image.rDT);
+      image.fireCount = stream->readInt(3);
+      image.altFireCount = stream->readInt(3);
+      image.reloadCount = stream->readInt(3);
+      image.loaded = stream->readFlag();
+      image.ammo = stream->readFlag();
+      image.target = stream->readFlag();
+      image.wet = stream->readFlag();
+      image.motion = stream->readFlag();
+      image.triggerDown = stream->readFlag();
+      image.altTriggerDown = stream->readFlag();
+      for (U32 i = 0; i < ShapeBaseImageData::MaxGenericTriggers; ++i)
+         image.genericTrigger[i] = stream->readFlag();
+   }
+}
+
+DefineEngineMethod(ShapeBase, confirmImageShot, bool, (S32 slot),,
+   "Confirm projectile creation inside the active server firing callback. Applies camera recoil after the callback.")
+{
+   return slot >= 0 && object->confirmImageShot(U32(slot));
+}
+
+DefineEngineMethod(ShapeBase, setImagePredictionAmmo, void, (S32 slot, S32 count),,
+   "Set server-owned shots remaining for procedural image prediction; -1 means unlimited ammunition.")
+{
+   if (slot >= 0)
+      object->setImagePredictionAmmo(U32(slot), count);
+}
+
 void ShapeBase::setImageState(U32 imageSlot, U32 newState, bool force)
 {
    if (!mMountedImageList[imageSlot].dataBlock)
       return;
    MountedImage& image = mMountedImageList[imageSlot];
+
+   if (mRestoringImageSimulation)
+   {
+      image.state = &image.dataBlock->state[newState];
+      image.delayTime = image.state->timeoutValue;
+      return;
+   }
+   if (usesPredictedImageState(imageSlot))
+   {
+      setImageSimulationState(imageSlot, newState, force);
+      return;
+   }
 
 
    // The client never enters the initial fire state on its own, but it
@@ -3017,6 +3620,8 @@ void ShapeBase::updateAnimThread(U32 imageSlot, S32 imageShapeIndex, ShapeBaseIm
 
 void ShapeBase::updateImageState(U32 imageSlot,F32 dt)
 {
+   if (usesPredictedImageState(imageSlot) && (!mAdvancingImageSimulation || mMountedImageList[imageSlot].shotContext.active))
+      return;
    if (!mMountedImageList[imageSlot].dataBlock)
       return;
    MountedImage& image = mMountedImageList[imageSlot];
@@ -3047,7 +3652,7 @@ TICKAGAIN:
          newEnergy = 0;
       setEnergyLevel(newEnergy);
 
-      if (!isGhost()) 
+      if (!isGhost() || usesPredictedImageState(imageSlot))
       {
          bool ammo = newEnergy > imageData.minEnergy;
          if (ammo != image.ammo) 
@@ -3091,13 +3696,15 @@ TICKAGAIN:
    }
 
    // Update the spinning thread timeScale
+   if (usesPredictedImageState(imageSlot) && (!mImageTransitionBudget || !image.dataBlock))
+      return;
    U32 imageShapeIndex = getImageShapeIndex(image);
    for (U32 i=0; i<ShapeBaseImageData::MaxShapes; ++i)
    {
       if (!image.dataBlock->shapeIsValid[i] || (i != imageShapeIndex && !image.doAnimateAllShapes))
          continue;
 
-      if (image.spinThread[i])
+      if (image.spinThread[i] && !usesPredictedImageState(imageSlot))
       {
          F32 timeScale;
 
@@ -3145,6 +3752,9 @@ void ShapeBase::updateImageAnimation(U32 imageSlot, F32 dt)
       return;
    MountedImage& image = mMountedImageList[imageSlot];
    U32 imageShapeIndex = getImageShapeIndex(image);
+
+   if (usesPredictedImageState(imageSlot))
+      updateProceduralImageSpin(imageSlot);
 
    // Advance animation threads
    for (U32 i=0; i<ShapeBaseImageData::MaxShapes; ++i)

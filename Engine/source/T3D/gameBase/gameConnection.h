@@ -364,7 +364,7 @@ public:
    /// @{
 
    bool isFirstPerson() const  { return mCameraPos == 0; }
-   bool isAIControlled() { return mAIControlled; }
+   bool isAIControlled() const { return mAIControlled; }
 
    void doneScopingScene() override;
    void demoPlaybackComplete() override;

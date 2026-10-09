@@ -173,9 +173,18 @@ pip-log.txt
 # Mac
 .DS_Store
 
+#################
+## JetBrains/Rider
+#################
+
+# IDE-generated project metadata. Any already tracked project files remain tracked.
+.idea/
+
 #############
 ## Torque
 #############
+/AGENTS.md
+/AGENTS-reference.md
 *.dso
 console.log
 *.cached.dts
